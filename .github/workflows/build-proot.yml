@@ -1,0 +1,222 @@
+name: Build proot for Android
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'build/proot/**'
+      - '.github/workflows/build-proot.yml'
+    branches: [main]
+  release:
+    types: [created]
+
+env:
+  PROOT_REPO: termux/proot
+  PROOT_TAG: v5.1.107.89
+  NDK_VERSION: '28.2.13676358'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [arm64-v8a, armeabi-v7a, x86_64, x86]
+        include:
+          - arch: arm64-v8a
+            target: aarch64-linux-android
+            cc_prefix: aarch64-linux-android21-clang
+            triple: aarch64
+            api: 21
+          - arch: armeabi-v7a
+            target: armv7a-linux-androideabi
+            cc_prefix: armv7a-linux-androideabi21-clang
+            triple: arm
+            api: 21
+          - arch: x86_64
+            target: x86_64-linux-android
+            cc_prefix: x86_64-linux-android21-clang
+            triple: x86_64
+            api: 21
+          - arch: x86
+            target: i686-linux-android
+            cc_prefix: i686-linux-android21-clang
+            triple: i686
+            api: 21
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Android NDK
+        run: |
+          sudo apt-get update && sudo apt-get install -y android-sdk
+          sdkmanager --install "ndk;${{ env.NDK_VERSION }}" --sdk_root=$ANDROID_HOME || \
+          wget -q "https://dl.google.com/android/repository/android-ndk-r28b-linux.zip" -O /tmp/ndk.zip \
+          && sudo unzip -q /tmp/ndk.zip -d /opt \
+          && echo "ANDROID_NDK_HOME=/opt/android-ndk-r28b" >> $GITHUB_ENV
+          echo "NDK=${ANDROID_HOME}/ndk/${{ env.NDK_VERSION }}" >> $GITHUB_ENV
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y \
+            build-essential \
+            git \
+            wget \
+            python3 \
+            cmake \
+            gettext \
+            autopoint \
+            autoconf \
+            automake \
+            libtool
+
+      - name: Build talloc (static)
+        run: |
+          cd /tmp
+          wget -q "https://www.samba.org/ftp/talloc/talloc-2.4.2.tar.gz"
+          tar xzf talloc-2.4.2.tar.gz
+          cd talloc-2.4.2
+
+          TOOLCHAIN="${{ env.NDK }}/toolchains/llvm/prebuilt/linux-x86_64"
+          TARGET="${{ matrix.target }}"
+
+          ./configure \
+            --cross-compile \
+            --cross-host=${TARGET} \
+            CC="${TOOLCHAIN}/bin/${{ matrix.cc_prefix }}" \
+            AR="${TOOLCHAIN}/bin/llvm-ar" \
+            RANLIB="${TOOLCHAIN}/bin/llvm-ranlib" \
+            --prefix=/tmp/talloc-install \
+            --disable-shared \
+            --enable-static
+
+          make -j$(nproc)
+          make install
+
+          # Verify
+          ls -la /tmp/talloc-install/lib/
+          file /tmp/talloc-install/lib/libtalloc.a
+
+      - name: Build libandroid-shmem (static)
+        run: |
+          cd /tmp
+          git clone --depth=1 https://github.com/niccokunzmann/libandroid-shmem.git
+          cd libandroid-shmem
+
+          TOOLCHAIN="${{ env.NDK }}/toolchains/llvm/prebuilt/linux-x86_64"
+
+          mkdir -p build && cd build
+          cmake .. \
+            -DCMAKE_TOOLCHAIN_FILE=${{ env.NDK }}/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=${{ matrix.arch }} \
+            -DANDROID_PLATFORM=android-${{ matrix.api }} \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/tmp/shmem-install
+
+          make -j$(nproc)
+          make install
+
+          ls -la /tmp/shmem-install/lib/
+
+      - name: Clone termux/proot
+        run: |
+          cd /tmp
+          git clone --depth=1 --branch ${{ env.PROOT_TAG }} https://github.com/${{ env.PROOT_REPO }}.git proot-src
+          cd proot-src
+          git log --oneline -3
+          echo "---"
+          head -50 src/GNUmakefile
+
+      - name: Build proot
+        run: |
+          cd /tmp/proot-src/src
+
+          TOOLCHAIN="${{ env.NDK }}/toolchains/llvm/prebuilt/linux-x86_64"
+          TARGET="${{ matrix.target }}"
+          TRIPLE="${{ matrix.triple }}"
+
+          # Set cross-compile variables
+          export CROSS_COMPILE="${TOOLCHAIN}/bin/${TARGET}-"
+          export CC="${TOOLCHAIN}/bin/${{ matrix.cc_prefix }}"
+          export AR="${TOOLCHAIN}/bin/llvm-ar"
+          export STRIP="${TOOLCHAIN}/bin/llvm-strip"
+          export OBJCOPY="${TOOLCHAIN}/bin/llvm-objcopy"
+          export OBJDUMP="${TOOLCHAIN}/bin/llvm-objdump"
+          export LD="${CC}"
+
+          # Set include/lib paths for talloc and shmem
+          export CPPFLAGS="-I/tmp/talloc-install/include -I/tmp/shmem-install/include"
+          export LDFLAGS="-L/tmp/talloc-install/lib -L/tmp/shmem-install/lib -ltalloc -landroid-shmem"
+
+          # Enable Android shmem support
+          export PROOT_WITH_LIBANDROID_SHMEM=1
+
+          # Build
+          make clean || true
+          make -j$(nproc) V=1
+
+          # Verify binary
+          file proot
+          ls -la proot
+
+          # Copy to dist
+          mkdir -p /tmp/dist/${{ matrix.arch }}
+          cp proot /tmp/dist/${{ matrix.arch }}/libproot.so
+          echo "Built: $(ls -la /tmp/dist/${{ matrix.arch }}/libproot.so)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: proot-${{ matrix.arch }}
+          path: /tmp/dist/${{ matrix.arch }}/libproot.so
+          retention-days: 7
+
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Show artifacts
+        run: |
+          find artifacts/ -type f -name "libproot.so" | while read f; do
+            echo "$f: $(ls -la "$f")"
+            file "$f"
+          done
+
+      - name: Copy to jniLibs
+        run: |
+          mkdir -p jniLibs
+          for arch in arm64-v8a armeabi-v7a x86_64 x86; do
+            src="artifacts/proot-${arch}/libproot.so"
+            if [ -f "$src" ]; then
+              mkdir -p "jniLibs/${arch}"
+              cp "$src" "jniLibs/${arch}/libproot.so"
+              echo "✓ ${arch}: $(ls -la "jniLibs/${arch}/libproot.so")"
+            fi
+          done
+
+      - name: Upload combined artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libproot-all
+          path: jniLibs/**/libproot.so
+          retention-days: 30
+
+      - name: Add to release
+        if: github.event_name == 'release'
+        run: |
+          for arch in arm64-v8a armeabi-v7a x86_64 x86; do
+            file="jniLibs/${arch}/libproot.so"
+            if [ -f "$file" ]; then
+              gh release upload "${{ github.event.release.tag_name }}" \
+            "$file#${arch}-libproot.so" \
+            --repo "${{ github.repository }}"
+            fi
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
