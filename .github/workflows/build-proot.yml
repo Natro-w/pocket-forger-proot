@@ -6,7 +6,7 @@ on:
     paths:
       - 'build/proot/**'
       - '.github/workflows/build-proot.yml'
-    branches: [main]
+    branches: [main, master]
   release:
     types: [created]
 
